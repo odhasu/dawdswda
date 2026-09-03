@@ -1,0 +1,24 @@
+{
+  "name": "medalbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Automated Medal.tv account creation by replaying the Medal-Electron signup HTTP flow with hCaptcha solved through OnyxSolver.",
+  "type": "commonjs",
+  "main": "medal_signup.js",
+  "scripts": {
+    "start": "node medal_signup.js",
+    "signup": "node medal_signup.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "fast-crc32c": "^2.0.0",
+    "https-proxy-agent": "^7.0.5",
+    "socks-proxy-agent": "^8.0.4",
+    "uuid": "^10.0.0",
+    "playwright": "^1.48.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

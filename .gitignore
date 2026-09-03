@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Secrets & credentials
+.env
+proxies.txt
+
+# Runtime output (accounts, tokens, pairing state)
+accounts.jsonl
+accounts.jsonl.*
+failed-accounts.jsonl
+failed-accounts.jsonl.*
+used_proxies.json
+bad_java_cookies.jsonl
+
+# Operational lists (create locally)
+medalusername.txt
+
+# PM2 / process logs
+logs/
+*.out.log
+*.err.log
+
+# Clip assets (large binaries)
+mp4clip/
+
+# Script backups
+*.js.a
+*.json.b
+
+# OS / editor
+.DS_Store
+.cursor/
+
+# Minecraft session cookies (account-takeover risk — never commit)
+java_cookies/
+bad_java_cookies/
+*.jsonl.bak
