@@ -438,7 +438,7 @@ function loadConfig(options = {}) {
         .filter((s) => s && s.toLowerCase() !== 'any'),
       product: process.env.FIVESIM_PRODUCT || 'medal',
       // Per-attempt wait (lowered from 5min so burned numbers get recycled fast)
-      waitMs: parseInt(process.env.FIVESIM_WAIT_MS || '50000', 10),
+      waitMs: parseInt(process.env.FIVESIM_WAIT_MS || '75000', 10),
       pollMs: parseInt(process.env.FIVESIM_POLL_MS || '5000', 10),
       // How many phone numbers to try before giving up (each costs ~$0.08).
       // Acts as a hard ceiling across all operators. Default 12 = 4 ops * 3.
@@ -3083,7 +3083,7 @@ async function verifyPhone({ cfg, client, authHeader, userId }) {
         }
         // Longer cool-down on 429 so we don't pile back into the same throttle window.
         if (is429) {
-          await new Promise((r) => setTimeout(r, 4000 + Math.floor(Math.random() * 4000)));
+          await new Promise((r) => setTimeout(r, 15000 + Math.floor(Math.random() * 10000)));
         }
         continue; // next attempt with a fresh phone
       }
@@ -3127,7 +3127,7 @@ async function verifyPhone({ cfg, client, authHeader, userId }) {
         );
       }
       // Long cool-down so Medal's per-user phone-update throttle can reset.
-      await new Promise((r) => setTimeout(r, 8000 + Math.floor(Math.random() * 4000)));
+      await new Promise((r) => setTimeout(r, 20000 + Math.floor(Math.random() * 10000)));
       continue;
     }
 
@@ -3960,36 +3960,59 @@ async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, coo
   }
   vlog(`[link] userId=${userId} callbackId=${callbackId}`);
 
-  // 2. Drive the Microsoft OAuth over HTTP cookies (no browser window).
-  let res;
+  // 2. Open a Chromium window with the cookies — you click "accept" manually.
+  let browser = null;
+  let reachedCallback = false;
   try {
-    res = await linkMedalViaCookies(cookieFile, loginUrl, proxy);
-  } catch (e) {
-    log(`  [link] oauth error: ${e.message}`);
-    return { linked: false, reason: `oauth_error: ${e.message}` };
-  }
-
-  if (res.status === 'success') {
-    log(`  [link] success: account ${userId} connected to the Microsoft identity`);
-    return { linked: true, status: 'success', callbackId };
-  }
-  if (res.status === 'error') {
-    const msg = res.message || `errorCode ${res.errorCode || 'unknown'}`;
-    log(`  [link] Medal rejected the link: ${msg}`);
-    return { linked: false, reason: msg };
-  }
-
-  // Stuck on a non-Medal page (stale/dead cookie) — reject fast, no polling.
-  if (!res.status) {
-    let host = '';
-    try { host = new URL(res.finalUrl).hostname; } catch (_) {}
-    if (!host.endsWith('medal.tv')) {
-      log(`  [link] cookie session rejected (stuck at ${res.finalUrl})`);
-      return { linked: false, reason: 'cookie_session_rejected' };
+    const playwright = require('playwright');
+    const launchOpts = { headless: false };
+    if (cfg.javaLinkProxyMode === 'proxy' && proxy) {
+      const pxy = toPlaywrightProxy(proxy);
+      if (pxy) launchOpts.proxy = pxy;
     }
+    browser = await playwright.chromium.launch(launchOpts);
+    const context = await browser.newContext({ viewport: { width: 980, height: 720 }, locale: 'en-US' });
+    let seeded = 0;
+    try {
+      const cookies = cookieFileToPlaywrightCookies(cookieFile);
+      seeded = cookies.length;
+      if (seeded) await context.addCookies(cookies);
+    } catch (e) {
+      log(`  [link] cookie seeding error: ${e.message}`);
+    }
+    if (seeded === 0) {
+      log('  [link] no Microsoft auth cookies in export (nothing to replay)');
+      return { linked: false, reason: 'no_ms_cookies' };
+    }
+    vlog(`[link] seeded ${seeded} Microsoft cookie(s); opening ${loginUrl}`);
+    const page = await context.newPage();
+    page.on('pageerror', (err) => vlog(`  [link] page error: ${err.message}`));
+    await page.goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+    const drv = await driveMsaOauth(page, cfg.javaLinkTimeoutMs, log);
+    reachedCallback = drv.ok;
+    if (drv.error) {
+      const msg = drv.message || `errorCode ${drv.errorCode || 'unknown'}`;
+      log(`  [link] Medal rejected the link: ${msg}`);
+      return { linked: false, reason: msg };
+    }
+    if (!drv.ok) {
+      const where = drv.url ? `${drv.url}${drv.title ? `  ("${drv.title}")` : ''}` : '(window closed / no page)';
+      log(`  [link] never reached Medal callback within ${cfg.javaLinkTimeoutMs}ms — window was on: ${where}`);
+    }
+    await closeBrowserQuiet(browser);
+    browser = null;
+  } catch (e) {
+    log(`  [link] browser error: ${e.message}`);
+    return { linked: false, reason: `browser_error: ${e.message}` };
+  } finally {
+    if (browser) await closeBrowserQuiet(browser);
   }
 
-  // 3. No terminal status in the redirect — poll Medal's callback for the verdict.
+  if (!reachedCallback) {
+    return { linked: false, reason: 'oauth_timeout_or_signin' };
+  }
+
+  // 3. Medal processes the code server-side; poll for the verdict.
   const poll = await pollConnectionCallback(medalClient, callbackId, 60000);
   if (poll && poll.status === 'success') {
     log(`  [link] success: account ${userId} connected to the Microsoft identity`);
@@ -3998,7 +4021,7 @@ async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, coo
   const msg =
     poll && poll.status === 'error'
       ? (poll.data && (poll.data.errorMessage || poll.data.message)) || 'error status'
-      : `oauth_stuck: ${res.finalUrl}`;
+      : 'callback_not_confirmed';
   log(`  [link] Microsoft rejected the link: ${msg}`);
   return { linked: false, reason: msg };
 }
@@ -4242,6 +4265,7 @@ async function runJavaFlow({ cfg, args, proxies }) {
     if (record.questClaim && record.questClaim.accepted) {
       try {
         const cookiePath = path.join(cfg.javaCookieDir, record.javaCookieFile);
+        await sleepMs(3000); // let the clip/claim settle before joining DonutSMP
         const redeemRes = await redeemMedal(cookiePath, proxy);
         record.medalRedeemed = redeemRes;
         if (redeemRes.success) {
@@ -4449,6 +4473,7 @@ async function runJavaRelink({ cfg, args }) {
     if (acct.questClaim && acct.questClaim.accepted) {
       try {
         const cookiePath = path.join(cfg.javaCookieDir, acct.javaCookieFile);
+        await sleepMs(3000); // let the clip/claim settle before joining DonutSMP
         const redeemRes = await redeemMedal(cookiePath, acct.proxy || null);
         acct.medalRedeemed = redeemRes;
         if (redeemRes.success) {

@@ -1,0 +1,3 @@
+# Put your SOCKS5 proxy here (first non-comment line is used)
+# Format: socks5://user:pass@host:port
+socks5://0a9f5ea5094b7e00:2DOYWMtmuazU8fld@res.proxy-seller.com:10031
