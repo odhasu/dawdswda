@@ -53,6 +53,7 @@ const crc32c = require('fast-crc32c');
 const { FiveSim } = require('./lib/sms5sim');
 const { loadJavaCookieInfo, parseNetscapeCookieFile } = require('./lib/java_cookie');
 const { redeemMedal } = require('./lib/redeem');
+const { linkMedalViaCookies } = require('./lib/minecraft_auth');
 
 // Per-worker context: when set, log() prefixes its output with the worker tag.
 // Unset (top-level / sequential mode) → log() behaves exactly as before.
@@ -324,6 +325,12 @@ function loadConfig(options = {}) {
       process.env.JAVA_COOKIE_DELAY_MS || '3000',
       10
     ),
+    // Delay between Microsoft link attempts (ms) — gives the proxy/session a
+    // breather between cookies so we don't hammer login.live.com.
+    javaLinkDelayMs: parseInt(
+      process.env.JAVA_LINK_DELAY_MS || '5000',
+      10
+    ),
     // Cookie files that FAILED the Microsoft link (session rejected, identity
     // already bound to another Medal account, …) are MOVED here so re-runs
     // skip them instead of burning a fresh 5sim number on the same dead cookie.
@@ -342,7 +349,7 @@ function loadConfig(options = {}) {
     // How long a single Microsoft-link attempt may take (consent page + OAuth
     // round-trip) before the cookie is treated as dead.
     javaLinkTimeoutMs: parseInt(
-      process.env.JAVA_LINK_TIMEOUT_MS || '240000',
+      process.env.JAVA_LINK_TIMEOUT_MS || '60000',
       10
     ),
     // Which egress the Microsoft-link Chromium window uses. The exported MSA
@@ -431,7 +438,7 @@ function loadConfig(options = {}) {
         .filter((s) => s && s.toLowerCase() !== 'any'),
       product: process.env.FIVESIM_PRODUCT || 'medal',
       // Per-attempt wait (lowered from 5min so burned numbers get recycled fast)
-      waitMs: parseInt(process.env.FIVESIM_WAIT_MS || '90000', 10),
+      waitMs: parseInt(process.env.FIVESIM_WAIT_MS || '50000', 10),
       pollMs: parseInt(process.env.FIVESIM_POLL_MS || '5000', 10),
       // How many phone numbers to try before giving up (each costs ~$0.08).
       // Acts as a hard ceiling across all operators. Default 12 = 4 ops * 3.
@@ -3598,7 +3605,7 @@ function maskProxy(p) {
 function listJavaCookieFiles(cfg, cliPath) {
   const targets = [];
   const push = (f) => {
-    if (/\.(txt|json|bak)$/i.test(f)) targets.push(f);
+    if (/\.(txt|json|bak)$/i.test(f) && !/\.reason\.txt$/i.test(f)) targets.push(f);
   };
   if (cliPath) {
     const abs = path.resolve(cliPath);
@@ -3644,7 +3651,7 @@ function loadBadJavaCookies(cfg) {
   const dir = cfg.badJavaCookiesDir;
   if (!dir || !fs.existsSync(dir)) return bad;
   for (const f of fs.readdirSync(dir)) {
-    if (/\.(txt|json|bak)$/i.test(f)) bad.add(f);
+    if (/\.(txt|json|bak)$/i.test(f) && !/\.reason\.txt$/i.test(f)) bad.add(f);
   }
   return bad;
 }
@@ -3925,14 +3932,25 @@ async function driveMsaOauth(page, timeoutMs, logFn) {
 async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, cookieFile }) {
   const medalClient = new MedalClient({ proxy, timezone: cfg.timezone });
 
-  // 1. Ask Medal to open a "microsoft" connection for this user.
+  // 1. Ask Medal to open a "microsoft" connection for this user (with retry).
   let begin;
   try {
-    begin = await medalClient.postJson(
-      `${MEDAL_API}/connections`,
-      { provider: 'microsoft' },
-      medalClient.medalHeaders({ 'X-Authentication': authHeader })
-    );
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        begin = await medalClient.postJson(
+          `${MEDAL_API}/connections`,
+          { provider: 'microsoft' },
+          medalClient.medalHeaders({ 'X-Authentication': authHeader })
+        );
+        break;
+      } catch (e) {
+        if (attempt < 2 && /EADDRINUSE|ECONNRESET|ETIMEDOUT|ECONNREFUSED/.test(String(e.message || ''))) {
+          await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
+          continue;
+        }
+        throw e;
+      }
+    }
   } catch (e) {
     return { linked: false, reason: `begin_connection_failed: ${e.message}` };
   }
@@ -3942,68 +3960,36 @@ async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, coo
   }
   vlog(`[link] userId=${userId} callbackId=${callbackId}`);
 
-  // 2. Replay the Microsoft OAuth in a headful Chromium seeded with the
-  //    exported session cookies.
-  let browser = null;
-  let reachedCallback = false;
+  // 2. Drive the Microsoft OAuth over HTTP cookies (no browser window).
+  let res;
   try {
-    const playwright = require('playwright');
-    const launchOpts = { headless: true };
-    if (cfg.javaLinkProxyMode === 'proxy' && proxy) {
-      const pxy = toPlaywrightProxy(proxy);
-      if (pxy) launchOpts.proxy = pxy;
-    }
-    browser = await playwright.chromium.launch(launchOpts);
-    const context = await browser.newContext({
-      viewport: { width: 980, height: 720 },
-      locale: 'en-US',
-    });
-    let seeded = 0;
-    try {
-      const cookies = cookieFileToPlaywrightCookies(cookieFile);
-      seeded = cookies.length;
-      if (seeded) await context.addCookies(cookies);
-    } catch (e) {
-      log(`  [link] cookie seeding error: ${e.message}`);
-    }
-    if (seeded === 0) {
-      log('  [link] no Microsoft auth cookies in export (nothing to replay)');
-      return { linked: false, reason: 'no_ms_cookies' };
-    }
-    vlog(`[link] seeded ${seeded} Microsoft cookie(s); opening ${loginUrl}`);
-    const page = await context.newPage();
-    page.on('pageerror', (err) => vlog(`  [link] page error: ${err.message}`));
-    await page
-      .goto(loginUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
-      .catch(() => {});
-    const drv = await driveMsaOauth(page, cfg.javaLinkTimeoutMs, log);
-    reachedCallback = drv.ok;
-    if (drv.error) {
-      // Medal rejected the link with a concrete reason (errorCode 63 etc.).
-      const msg = drv.message || `errorCode ${drv.errorCode || 'unknown'}`;
-      log(`  [link] Medal rejected the link: ${msg}`);
-      return { linked: false, reason: msg };
-    }
-    if (!drv.ok) {
-      const where = drv.url
-        ? `${drv.url}${drv.title ? `  ("${drv.title}")` : ''}`
-        : '(window closed / no page)';
-      log(`  [link] never reached Medal callback within ${cfg.javaLinkTimeoutMs}ms — window was on: ${where}`);
-    }
-    await closeBrowserQuiet(browser);
-    browser = null;
+    res = await linkMedalViaCookies(cookieFile, loginUrl, proxy);
   } catch (e) {
-    log(`  [link] browser error: ${e.message}`);
-    return { linked: false, reason: `browser_error: ${e.message}` };
-  } finally {
-    if (browser) await closeBrowserQuiet(browser);
+    log(`  [link] oauth error: ${e.message}`);
+    return { linked: false, reason: `oauth_error: ${e.message}` };
   }
 
-  if (!reachedCallback) {
-    return { linked: false, reason: 'oauth_timeout_or_signin' };
+  if (res.status === 'success') {
+    log(`  [link] success: account ${userId} connected to the Microsoft identity`);
+    return { linked: true, status: 'success', callbackId };
+  }
+  if (res.status === 'error') {
+    const msg = res.message || `errorCode ${res.errorCode || 'unknown'}`;
+    log(`  [link] Medal rejected the link: ${msg}`);
+    return { linked: false, reason: msg };
   }
 
-  // 3. Medal processes the code server-side; poll for the terminal status.
+  // Stuck on a non-Medal page (stale/dead cookie) — reject fast, no polling.
+  if (!res.status) {
+    let host = '';
+    try { host = new URL(res.finalUrl).hostname; } catch (_) {}
+    if (!host.endsWith('medal.tv')) {
+      log(`  [link] cookie session rejected (stuck at ${res.finalUrl})`);
+      return { linked: false, reason: 'cookie_session_rejected' };
+    }
+  }
+
+  // 3. No terminal status in the redirect — poll Medal's callback for the verdict.
   const poll = await pollConnectionCallback(medalClient, callbackId, 60000);
   if (poll && poll.status === 'success') {
     log(`  [link] success: account ${userId} connected to the Microsoft identity`);
@@ -4012,7 +3998,7 @@ async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, coo
   const msg =
     poll && poll.status === 'error'
       ? (poll.data && (poll.data.errorMessage || poll.data.message)) || 'error status'
-      : 'callback_not_confirmed';
+      : `oauth_stuck: ${res.finalUrl}`;
   log(`  [link] Microsoft rejected the link: ${msg}`);
   return { linked: false, reason: msg };
 }
@@ -4164,7 +4150,7 @@ async function runJavaFlow({ cfg, args, proxies }) {
         log(`java flow: cookie ${cbase} rejected (${reason})`);
         pool.shift();
         recordBadJavaCookie(cfg, cbase, reason);
-        await sleepMs(1200);
+        await sleepMs(cfg.javaLinkDelayMs);
       }
     }
 
@@ -4380,7 +4366,7 @@ async function runJavaRelink({ cfg, args }) {
         log(`java relink: cookie ${cbase} rejected (${reason})`);
         pool.shift();
         recordBadJavaCookie(cfg, cbase, reason);
-        await sleepMs(1200);
+        await sleepMs(cfg.javaLinkDelayMs);
       }
     }
 
