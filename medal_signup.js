@@ -52,6 +52,7 @@ const crc32c = require('fast-crc32c');
 
 const { FiveSim } = require('./lib/sms5sim');
 const { loadJavaCookieInfo, parseNetscapeCookieFile } = require('./lib/java_cookie');
+const { redeemMedal } = require('./lib/redeem');
 
 // Per-worker context: when set, log() prefixes its output with the worker tag.
 // Unset (top-level / sequential mode) → log() behaves exactly as before.
@@ -329,6 +330,11 @@ function loadConfig(options = {}) {
     badJavaCookiesDir: path.resolve(
       __dirname,
       process.env.JAVA_BAD_COOKIES_DIR || 'bad_java_cookies'
+    ),
+    // Cookies that successfully redeemed /medal are moved here.
+    redeemedJavaCookiesDir: path.resolve(
+      __dirname,
+      process.env.JAVA_REDEEMED_COOKIES_DIR || 'redeemed_java_cookies'
     ),
     // Optional cap on how many fresh Medal accounts one java run may create.
     // When unset/0 the run keeps going until the cookie pool is exhausted.
@@ -2792,7 +2798,9 @@ async function verifyPhone({ cfg, client, authHeader, userId }) {
   // rushes. Pinning each verifyPhone() to its worker's proxy spreads buy
   // requests across as many upstream IPs as the proxy pool provides.
   // Falls back to direct (no proxy) when the worker isn't using a proxy.
-  const sms = new FiveSim({ ...cfg.fivesim, proxy: client && client.proxy ? client.proxy : null });
+  // 5sim does not need to share the account's IP, and the residential socks5
+  // proxy blocks 5sim (TLS handshake fails / timeouts). Route it direct.
+  const sms = new FiveSim({ ...cfg.fivesim, proxy: null });
   const retries = Math.max(1, cfg.fivesim.phoneRetries);
   const perOpCap = Math.max(1, cfg.fivesim.maxAttemptsPerOperator);
   // Higher cap for errorId:37 specifically — see config docstring.
@@ -3940,7 +3948,7 @@ async function linkMinecraftAccountWithMsa({ cfg, proxy, authHeader, userId, coo
   let reachedCallback = false;
   try {
     const playwright = require('playwright');
-    const launchOpts = { headless: false };
+    const launchOpts = { headless: true };
     if (cfg.javaLinkProxyMode === 'proxy' && proxy) {
       const pxy = toPlaywrightProxy(proxy);
       if (pxy) launchOpts.proxy = pxy;
@@ -4243,6 +4251,31 @@ async function runJavaFlow({ cfg, args, proxies }) {
       record.questClaim = { error: e.message };
     }
 
+    // 4c) redeem /medal in-game on the same proxy, then move the cookie to
+    //     redeemed_java_cookies/ so it's clearly done.
+    if (record.questClaim && record.questClaim.accepted) {
+      try {
+        const cookiePath = path.join(cfg.javaCookieDir, record.javaCookieFile);
+        const redeemRes = await redeemMedal(cookiePath, proxy);
+        record.medalRedeemed = redeemRes;
+        if (redeemRes.success) {
+          log(`java flow: /medal REDEEMED (${redeemRes.shards || 'shards'}) — moving cookie to redeemed/`);
+          try {
+            fs.mkdirSync(cfg.redeemedJavaCookiesDir, { recursive: true });
+            const dst = path.join(cfg.redeemedJavaCookiesDir, record.javaCookieFile);
+            if (fs.existsSync(cookiePath)) fs.renameSync(cookiePath, dst);
+          } catch (moveErr) {
+            log(`java flow: could not move cookie to redeemed/: ${moveErr.message}`);
+          }
+        } else {
+          log(`java flow: /medal failed: ${redeemRes.error || 'unknown'}`);
+        }
+      } catch (e) {
+        log(`java flow: /medal redemption error: ${e.message}`);
+        record.medalRedeemed = { error: e.message };
+      }
+    }
+
     // 5) finalize: enrich the record that was persisted right after phone
     //    verification with the link/quest/clip results (no second line).
     record.linkPending = false;
@@ -4424,6 +4457,30 @@ async function runJavaRelink({ cfg, args }) {
     } catch (e) {
       log(`java relink: quest claim FAILED: ${e.message}`);
       acct.questClaim = { error: e.message };
+    }
+
+    // redeem /medal in-game on the same proxy, then move the cookie to redeemed/
+    if (acct.questClaim && acct.questClaim.accepted) {
+      try {
+        const cookiePath = path.join(cfg.javaCookieDir, acct.javaCookieFile);
+        const redeemRes = await redeemMedal(cookiePath, acct.proxy || null);
+        acct.medalRedeemed = redeemRes;
+        if (redeemRes.success) {
+          log(`java relink: /medal REDEEMED (${redeemRes.shards || 'shards'}) — moving cookie to redeemed/`);
+          try {
+            fs.mkdirSync(cfg.redeemedJavaCookiesDir, { recursive: true });
+            const dst = path.join(cfg.redeemedJavaCookiesDir, acct.javaCookieFile);
+            if (fs.existsSync(cookiePath)) fs.renameSync(cookiePath, dst);
+          } catch (moveErr) {
+            log(`java relink: could not move cookie to redeemed/: ${moveErr.message}`);
+          }
+        } else {
+          log(`java relink: /medal failed: ${redeemRes.error || 'unknown'}`);
+        }
+      } catch (e) {
+        log(`java relink: /medal redemption error: ${e.message}`);
+        acct.medalRedeemed = { error: e.message };
+      }
     }
 
     acct.linkPending = false;
